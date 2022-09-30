@@ -19,27 +19,27 @@ pub fn RingQueue(comptime T: type, comptime _capacity: u16) type {
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        pub inline fn lenAtomic(self: *const Self) usize {
+        pub inline fn len(self: *const Self) usize {
             return @atomicLoad(usize, &self._len, .Monotonic);
         }
 
-        pub inline fn isEmptyAtomic(self: *const Self) bool {
-            return self.lenAtomic() == 0;
+        pub inline fn isEmpty(self: *const Self) bool {
+            return self.len() == 0;
         }
 
-        pub inline fn isFullAtomic(self: *const Self) bool {
-            return self.lenAtomic() == capacity;
+        pub inline fn isFull(self: *const Self) bool {
+            return self.len() == capacity;
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
         pub inline fn dequeueIfNotEmpty(self: *Self) ?T {
-            if (self.isEmptyAtomic()) return null;
+            if (self.isEmpty()) return null;
             return self.dequeueUnchecked();
         }
 
         pub inline fn enqueueIfNotFull(self: *Self, value: T) bool {
-            if (self.isFullAtomic()) return false;
+            if (self.isFull()) return false;
             self.enqueueUnchecked(value);
             return true;
         }
@@ -47,12 +47,12 @@ pub fn RingQueue(comptime T: type, comptime _capacity: u16) type {
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
         pub inline fn dequeueAssumeNotEmpty(self: *Self) T {
-            std.debug.assert(!self.isEmptyAtomic());
+            std.debug.assert(!self.isEmpty());
             return self.dequeueUnchecked();
         }
 
         pub inline fn enqueueAssumeNotFull(self: *Self, value: T) void {
-            std.debug.assert(!self.isFullAtomic());
+            std.debug.assert(!self.isFull());
             self.enqueueUnchecked(value);
         }
 
@@ -82,9 +82,9 @@ test "RingQueue basics" {
 
     const expectEqual = std.testing.expectEqual;
 
-    try expectEqual(@as(usize, 0), q.lenAtomic());
-    try expectEqual(true, q.isEmptyAtomic());
-    try expectEqual(false, q.isFullAtomic());
+    try expectEqual(@as(usize, 0), q.len());
+    try expectEqual(true, q.isEmpty());
+    try expectEqual(false, q.isFull());
 
     try expectEqual(true, q.enqueueIfNotFull('a'));
     try expectEqual(true, q.enqueueIfNotFull('b'));
@@ -92,9 +92,9 @@ test "RingQueue basics" {
     try expectEqual(true, q.enqueueIfNotFull('d'));
     try expectEqual(false, q.enqueueIfNotFull('e'));
 
-    try expectEqual(@as(usize, 4), q.lenAtomic());
-    try expectEqual(false, q.isEmptyAtomic());
-    try expectEqual(true, q.isFullAtomic());
+    try expectEqual(@as(usize, 4), q.len());
+    try expectEqual(false, q.isEmpty());
+    try expectEqual(true, q.isFull());
 
     try expectEqual(@as(u8, 'a'), q.dequeueIfNotEmpty().?);
     try expectEqual(@as(u8, 'b'), q.dequeueIfNotEmpty().?);
@@ -102,9 +102,9 @@ test "RingQueue basics" {
     try expectEqual(@as(u8, 'd'), q.dequeueIfNotEmpty().?);
     try expectEqual(null, q.dequeueIfNotEmpty());
 
-    try expectEqual(@as(usize, 0), q.lenAtomic());
-    try expectEqual(true, q.isEmptyAtomic());
-    try expectEqual(false, q.isFullAtomic());
+    try expectEqual(@as(usize, 0), q.len());
+    try expectEqual(true, q.isEmpty());
+    try expectEqual(false, q.isFull());
 }
 
 //------------------------------------------------------------------------------

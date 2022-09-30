@@ -3,7 +3,12 @@ const ring_queue = @import("ring_queue.zig");
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-const Order = std.builtin.AtomicOrder;
+const Error = error {
+    JobQueueUninitialized,
+    JobQueueStopped,
+};
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 const RingQueue = ring_queue.RingQueue;
 
@@ -129,11 +134,11 @@ fn JobSlot(comptime _max_job_size: u16) type {
         cycle    : u64                         = 0,
         // zig fmg: on
 
-        fn store(
+        fn storeJob(
             self: *Self,
+            prereq: JobId,
             job: anytype,
             index: usize,
-            prereq: JobId,
         ) JobId {
             const Job = @TypeOf(job);
             comptime compileAssert(
@@ -162,11 +167,13 @@ fn JobSlot(comptime _max_job_size: u16) type {
             std.mem.copy(u8, &self.data, std.mem.asBytes(&job));
 
             const main: *const fn (*Job) void = &@field(Job, "main");
+            const id = JobId.init(@truncate(u16, index), new_cycle);
+
             self.main = @ptrCast(Main, main);
             self.name = @typeName(Job);
-            self.id = JobId.init(@truncate(u16, index), new_cycle);
-            self.prereq = prereq;
-            return self.id;
+            self.id = id;
+            self.prereq = if (prereq != id) prereq else JobId.none;
+            return id;
         }
 
         fn executeJob(self: *Self, id: JobId) void {
@@ -196,7 +203,7 @@ fn JobSlot(comptime _max_job_size: u16) type {
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-const LockScope = enum { unlocked, locked };
+const Locking = enum { unlocked, locked };
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -218,16 +225,26 @@ fn ProcessJobResultType(comptime result: ProcessJobResult) type {
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-pub const min_jobs = 256;
+pub const min_jobs = 16;
 
 pub const min_job_size = cache_line_size;
 
+pub const default_max_jobs = min_jobs;
+
+pub const default_max_threads = 8;
+
+pub const default_max_job_size = min_job_size;
+
+pub const default_idle_sleep_ns = 10;
+
 pub fn JobQueue(
     comptime config: struct {
-        max_jobs: u16 = min_jobs,
-        max_threads: u8 = 15,
-        max_job_size: u16 = min_job_size,
-        idle_sleep_ns: u64 = 10,
+        // zig fmt: off
+        max_jobs      : u16 = default_max_jobs,
+        max_threads   : u8  = default_max_threads,
+        max_job_size  : u16 = default_max_job_size,
+        idle_sleep_ns : u32 = default_idle_sleep_ns,
+        // zig fmt: on
     },
 ) type {
     compileAssert(
@@ -299,7 +316,7 @@ pub fn JobQueue(
         _initialized : usize     = 0,
         _started     : usize     = 0,
         _running     : usize     = 0,
-        _stopped     : usize     = 0,
+        _stopping    : usize     = 0,
         // zig fmt: on
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -322,11 +339,6 @@ pub fn JobQueue(
             self._initialized = 1;
 
             return self;
-        }
-
-        pub fn reinit(self: *Self) void {
-            self.deinit();
-            self.* = init();
         }
 
         pub fn deinit(self: *Self) void {
@@ -377,17 +389,8 @@ pub fn JobQueue(
             @atomicStore(u64, &self._running, 0, .Monotonic);
 
             // prevent scheduling more jobs
-            assertEqual("self._stopped", self._stopped, 0);
-            @atomicStore(u64, &self._stopped, 1, .Monotonic);
-
-            // drain job queue on calling thread
-            var id = JobId.none;
-            if (self.dequeueJobIdIfAvailable()) |a| {
-                id = a;
-                while (self.processJob(id, .unlocked, .next_jobid)) |b| {
-                    id = b;
-                }
-            }
+            assertEqual("self._stopping", self._stopping, 0);
+            @atomicStore(u64, &self._stopping, 1, .Monotonic);
         }
 
         pub fn join(self: *Self) void {
@@ -402,14 +405,13 @@ pub fn JobQueue(
                 self._threads[i].join();
             }
 
-            // drain job queue on calling thread
-            var id = JobId.none;
-            if (self.dequeueJobIdIfAvailable()) |a| {
-                id = a;
-                while (self.processJob(id, .unlocked, .next_jobid)) |b| {
-                    id = b;
-                }
-            }
+            // copy mutex and clean up
+            var mutex = self._mutex;
+            mutex.lock();
+            defer mutex.unlock();
+
+            // drain job queue
+            self.processJobs(.locked, .next_jobid);
 
             // reset to default state
             self.* = Self{};
@@ -417,16 +419,35 @@ pub fn JobQueue(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+        pub fn isInitialized(self: *const Self) bool {
+            const initialized = @atomicLoad(u64, &self._initialized, .Monotonic);
+            if (initialized == 0) return false;
+
+            assertEqual("initialized", initialized, 1);
+            return true;
+        }
+
         pub fn isRunning(self: *const Self) bool {
             const running = @atomicLoad(u64, &self._running, .Monotonic);
-            // print("running: {}\n", .{running});
             if (running == 0) return false;
 
             assertEqual("running", running, 1);
             return true;
         }
 
+        pub fn isStopping(self: *const Self) bool {
+            const stopping = @atomicLoad(u64, &self._stopping, .Monotonic);
+            if (stopping == 0) return false;
+
+            assertEqual("stopping", stopping, 1);
+            return true;
+        }
+
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        pub fn len(self: *const Self) usize {
+            return self._live_queue.len();
+        }
 
         pub fn isComplete(self: *const Self, id: JobId) bool {
             if (id == JobId.none) return true;
@@ -450,40 +471,92 @@ pub fn JobQueue(
             return slot_cycle == _id.cycle;
         }
 
-        pub fn len(self: *const Self) usize {
-            return self._live_queue.lenAtomic();
-        }
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        const WaitJob = struct {
+            const Jobs = Self;
+            const max_ids: usize = (@sizeOf(Slot) / @sizeOf(JobId)) - @sizeOf(*Jobs);
+
+            jobs: *Jobs,
+            prereqs: [max_ids]JobId = [_]JobId{JobId.none} ** max_ids,
+
+            fn main(self: *@This()) void {
+                for (self.prereqs) |prereq| {
+                    self.jobs.wait(prereq);
+                }
+            }
+        };
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        // TODO: consider making this return an error if you cannot schedule
-        // a job because of one of the following:
-        // - uninitialized
-        // - stopped/joining
-        pub fn schedule(self: *Self, prereqs: JobIds, job: anytype) JobId {
+        pub fn combine(self: *Self, prereqs: []const JobId) Error!JobId {
+            var id = JobId.none;
+            var i: usize = 0;
+            const in: []const JobId = prereqs;
+            while (i < in.len) {
+                var wait_job = WaitJob{ .jobs = self };
+
+                // copy prereqs to wait_job
+                var o: usize = 0;
+                const out: []JobId = &wait_job.prereqs;
+                while (i < in.len and o < out.len) {
+                    out[o] = in[i];
+                    i += 1;
+                    o += 1;
+                }
+
+                id = try self.schedule(id, wait_job);
+            }
+            return id;
+        }
+
+        pub fn wait(self: *Self, prereq: JobId) void {
+            while (self.isPending(prereq)) {
+                print("waiting for {}...\n", .{prereq});
+                threadIdle();
+            }
+        }
+
+        pub fn schedule(self: *Self, prereq: JobId, job: anytype) Error!JobId {
+            self.lock("schedule");
+            defer self.unlock("schedule");
+
+            if (self._initialized != 1) return .JobQueueUninitialized;
+            if (self._stopping != 0) return .JobQueueStopped;
+            return self.scheduleUnchecked(prereq, job);
+        }
+
+        pub fn scheduleAssumeReady(
+            self: *Self,
+            prereq: JobId,
+            job: anytype,
+        ) JobId {
             self.lock("schedule");
             defer self.unlock("schedule");
 
             assertEqual("self._initialized", self._initialized, 1);
-            assertEqual("self._stopped", self._stopped, 0);
+            assertEqual("self._stopping", self._stopping, 0);
+            return self.scheduleUnchecked(prereq, job);
+        }
 
-            assert(prereqs.len <= 1); // TODO: multiple prereqs
-            var prereq = if (prereqs.len == 0) JobId.none else prereqs[0];
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-            const index = self.acquireNextFreeIndex();
-
+        fn scheduleUnchecked(
+            self: *Self,
+            prereq: JobId,
+            job: anytype,
+        ) JobId {
             assert(self.isLockedThread());
-            const id = self._slots[index].store(job, index, prereq);
-
-            for (prereqs) |p| {
-                assert(p != id);
-            }
-
+            const index = self.dequeueFreeIndex();
+            const slot: *Slot = &self._slots[index];
+            const id = slot.storeJob(prereq, job, index);
             self.enqueueJobId(id);
             return id;
         }
 
-        inline fn acquireNextFreeIndex(self: *Self) usize {
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        fn dequeueFreeIndex(self: *Self) usize {
             assert(self.isLockedThread());
 
             if (self._free_queue.dequeueIfNotEmpty()) |index| {
@@ -499,16 +572,30 @@ pub fn JobQueue(
             }
         }
 
-        inline fn enqueueJobId(self: *Self, new_id: JobId) void {
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        fn enqueueJobId(self: *Self, new_id: JobId) void {
             assert(self.isLockedThread());
 
-            while (self._live_queue.isFullAtomic()) {
+            while (self._live_queue.isFull()) {
                 // must process jobs to unblock live queue
                 const old_id = self._live_queue.dequeueAssumeNotEmpty();
                 self.processJob(old_id, .locked, .none);
             }
 
             self._live_queue.enqueueAssumeNotFull(new_id);
+        }
+
+        fn dequeueJobId(self: *Self, comptime locking: Locking) ?JobId {
+            if (self._live_queue.isEmpty()) {
+                return null;
+            } else {
+                self.lockIfWasUnlocked("dequeueJobId", locking);
+                defer self.unlockIfWasUnlocked("dequeueJobId", locking);
+
+                assert(self.isLockedThread());
+                return self._live_queue.dequeueIfNotEmpty();
+            }
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -519,46 +606,43 @@ pub fn JobQueue(
             assert(self.notMainThread());
             assert(self.isUnlockedThread());
 
-            var id = JobId.none;
             while (self.isRunning()) {
-                if (self.dequeueJobIdIfAvailable()) |a| {
-                    id = a;
-                    // self.processJob(id, .unlocked, .none);
-                    while (self.processJob(id, .unlocked, .next_jobid_if_running)) |b| {
-                        id = b;
-                    }
-                }
-                if (idle_sleep_ns > 0) {
-                    std.time.sleep(idle_sleep_ns);
-                }
+                self.processJobs(.unlocked, .next_jobid_if_running);
+                threadIdle();
             }
 
             print("thread[{}] DONE\n", .{ n });
         }
 
-        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-        fn dequeueJobIdIfAvailable(self: *Self) ?JobId {
-            assert(self.isUnlockedThread());
-
-            if (self._live_queue.isEmptyAtomic()) {
-                return null;
-            } else {
-                self.lock("dequeueJobIdIfAvailable");
-                defer self.unlock("dequeueJobIdIfAvailable");
-                return self._live_queue.dequeueIfNotEmpty();
+        fn threadIdle() void {
+            if (idle_sleep_ns > 0) {
+                std.time.sleep(idle_sleep_ns);
             }
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+        fn processJobs(
+            self: *Self,
+            comptime locking: Locking,
+            comptime result: ProcessJobResult,
+        ) void {
+            var id = JobId.none;
+            if (self.dequeueJobId(locking)) |a| {
+                id = a;
+                while (self.processJob(id, locking, result)) |b| {
+                    id = b;
+                }
+            }
+        }
+
         fn processJob(
             self: *Self,
             id: JobId,
-            comptime scope: LockScope,
+            comptime locking: Locking,
             comptime result: ProcessJobResult,
         ) ProcessJobResultType(result) {
-            // print("processJob({}, {}, {})\n", .{id, scope, result});
+            // print("processJob({}, {}, {})\n", .{id, locking, result});
 
             const _id = id.fields();
             assert(isLiveCycle(_id.cycle));
@@ -571,84 +655,85 @@ pub fn JobQueue(
             assert(slot.cycle == _id.cycle);
             assert(slot.prereq != id);
 
-            if (self.isPending(slot.prereq)) {
-                // this job's prerequisite is pending,
-                // requeue this job to be processed later
-                self.lockIfScopeUnlocked("processJob(a)", scope);
-                defer self.unlockIfScopeUnlocked("processJob(a)", scope);
+            while (self.isPending(slot.prereq)) {
+                threadIdle();
+            }
 
-                self.enqueueJobId(id);
-                switch (result) {
-                    .none => return,
-                    .free_index => return null,
-                    .next_jobid => {
-                        assert(self.isMainThread());
-                        assert(self.isLockedThread());
+            self.executeJob(slot, id, locking);
+
+            switch (result) {
+                .none => {
+                    self.lockIfWasUnlocked("processJob(b)", locking);
+                    defer self.unlockIfWasUnlocked("processJob(b)", locking);
+
+                    assert(self.isLockedThread());
+                    self._free_queue.enqueueAssumeNotFull(_id.index);
+                    return;
+                },
+                .free_index => {
+                    return _id.index;
+                },
+                .next_jobid => {
+                    assert(self.isMainThread());
+
+                    self.lockIfWasUnlocked("processJob(b)", locking);
+                    defer self.unlockIfWasUnlocked("processJob(b)", locking);
+
+                    assert(self.isLockedThread());
+                    self._free_queue.enqueueAssumeNotFull(_id.index);
+                    return self._live_queue.dequeueIfNotEmpty();
+                },
+                .next_jobid_if_running => {
+                    assert(self.notMainThread());
+
+                    self.lockIfWasUnlocked("processJob(b)", locking);
+                    defer self.unlockIfWasUnlocked("processJob(b)", locking);
+
+                    assert(self.isLockedThread());
+                    self._free_queue.enqueueAssumeNotFull(_id.index);
+                    if (self.isRunning()) {
                         return self._live_queue.dequeueIfNotEmpty();
-                    },
-                    .next_jobid_if_running => {
-                        assert(self.notMainThread());
-                        if (self.isRunning()) {
-                            assert(self.isLockedThread());
-                            return self._live_queue.dequeueIfNotEmpty();
-                        } else {
-                            return null;
-                        }
-                    },
-                }
-            } else {
-                self.executeJob(slot, id, scope);
-
-                self.lockIfScopeUnlocked("processJob(b)", scope);
-                defer self.unlockIfScopeUnlocked("processJob(b)", scope);
-
-                switch (result) {
-                    .none => {
-                        assert(self.isLockedThread());
-                        self._free_queue.enqueueAssumeNotFull(_id.index);
-                        return;
-                    },
-                    .free_index => return _id.index,
-                    .next_jobid => {
-                        assert(self.isMainThread());
-                        assert(self.isLockedThread());
-                        self._free_queue.enqueueAssumeNotFull(_id.index);
-                        return self._live_queue.dequeueIfNotEmpty();
-                    },
-                    .next_jobid_if_running => {
-                        assert(self.notMainThread());
-                        assert(self.isLockedThread());
-                        self._free_queue.enqueueAssumeNotFull(_id.index);
-                        if (self.isRunning()) {
-                            return self._live_queue.dequeueIfNotEmpty();
-                        } else {
-                            return null;
-                        }
-                    },
-                }
+                    } else {
+                        return null;
+                    }
+                },
             }
         }
 
-        inline fn executeJob(self: *Self, slot: *Slot, id: JobId, comptime scope: LockScope) void {
-            self.unlockIfScopeLocked("executeJob", scope);
-            defer self.lockIfScopeLocked("executeJob", scope);
+        inline fn executeJob(
+            self: *Self,
+            slot: *Slot,
+            id: JobId,
+            comptime locking: Locking,
+        ) void {
+            self.unlockIfWasLocked("executeJob", locking);
+            defer self.lockIfWasLocked("executeJob", locking);
 
             // we cannot be locked when executing a job,
             // because the job may call start() or schedule()
+            assert(self.isUnlockedThread());
             slot.executeJob(id);
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        inline fn lockIfScopeLocked(self: *Self, comptime site: []const u8, comptime scope: LockScope) void {
-            switch (scope) {
+        inline fn lockIfWasLocked(
+            self: *Self,
+            comptime site: []const u8,
+            comptime locking: Locking,
+        ) void {
+            switch (locking) {
                 .unlocked => assert(self.isUnlockedThread()),
                 .locked => self.lock(site),
             }
         }
 
-        inline fn unlockIfScopeLocked(self: *Self, comptime site: []const u8, comptime scope: LockScope) void {
-            switch (scope) {
+        inline fn unlockIfWasLocked(
+            self: *Self,
+            comptime site: []const u8,
+            comptime locking: Locking,
+        ) void {
+            switch (locking) {
                 .unlocked => assert(self.isUnlockedThread()),
                 .locked => self.unlock(site),
             }
@@ -656,18 +741,63 @@ pub fn JobQueue(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        inline fn lockIfScopeUnlocked(self: *Self, comptime site: []const u8, comptime scope: LockScope) void {
-            switch (scope) {
+        inline fn lockIfWasUnlocked(
+            self: *Self,
+            comptime site: []const u8,
+            comptime locking: Locking
+        ) void {
+            switch (locking) {
                 .unlocked => self.lock(site),
                 .locked => assert(self.isLockedThread()),
             }
         }
 
-        inline fn unlockIfScopeUnlocked(self: *Self, comptime site: []const u8, comptime scope: LockScope) void {
-            switch (scope) {
+        inline fn unlockIfWasUnlocked(
+            self: *Self,
+            comptime site: []const u8,
+            comptime locking: Locking,
+        ) void {
+            switch (locking) {
                 .unlocked => self.unlock(site),
                 .locked => assert(self.isLockedThread()),
             }
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        inline fn lock(self: *Self, comptime site:[]const u8) void {
+            const active = Thread.getCurrentId();
+            const locked = @atomicLoad(u64, &self._lock_thread, .Monotonic);
+            assert(active != locked);
+            assert(site.len > 0);
+
+            // print("~{} '{s}' locking...\n", .{active, site});
+            self._mutex.lock();
+            @atomicStore(u64, &self._lock_thread, active, .Monotonic);
+            // print("~{} '{s}' locked\n", .{active, site});
+        }
+
+        inline fn unlock(self: *Self, comptime site: []const u8) void {
+            const active = Thread.getCurrentId();
+            const locked = @atomicLoad(u64, &self._lock_thread, .Acquire);
+            assert(active == locked);
+            assert(site.len > 0);
+
+            @atomicStore(u64, &self._lock_thread, 0, .Release);
+            self._mutex.unlock();
+            // print("~{} '{s}' unlocked\n", .{active, site});
+        }
+
+        inline fn isLockedThread(self: *const Self) bool {
+            const active = Thread.getCurrentId();
+            const locked = @atomicLoad(u64, &self._lock_thread, .Monotonic);
+            return locked == active;
+        }
+
+        inline fn isUnlockedThread(self: *const Self) bool {
+            const active = Thread.getCurrentId();
+            const locked = @atomicLoad(u64, &self._lock_thread, .Monotonic);
+            return locked != active;
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -683,43 +813,6 @@ pub fn JobQueue(
             assert(main_thread != 0);
             return main_thread != Thread.getCurrentId();
         }
-
-        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-        inline fn lock(self: *Self, comptime site:[]const u8) void {
-            const lock_thread = @atomicLoad(u64, &self._lock_thread, .Monotonic);
-            const this_thread = Thread.getCurrentId();
-            assert(this_thread != lock_thread);
-            assert(site.len > 0);
-
-            // print("~{} '{s}' locking...\n", .{this_thread, site});
-            self._mutex.lock();
-            @atomicStore(u64, &self._lock_thread, this_thread, .Monotonic);
-            // print("~{} '{s}' locked\n", .{this_thread, site});
-        }
-
-        inline fn unlock(self: *Self, comptime site: []const u8) void {
-            const lock_thread = @atomicLoad(u64, &self._lock_thread, .Acquire);
-            const this_thread = Thread.getCurrentId();
-            assert(this_thread == lock_thread);
-            assert(site.len > 0);
-
-            @atomicStore(u64, &self._lock_thread, 0, .Release);
-            self._mutex.unlock();
-            // print("~{} '{s}' unlocked\n", .{this_thread, site});
-        }
-
-        inline fn isLockedThread(self: *const Self) bool {
-            const lock_thread = @atomicLoad(u64, &self._lock_thread, .Monotonic);
-            const this_thread = Thread.getCurrentId();
-            return lock_thread == this_thread;
-        }
-
-        inline fn isUnlockedThread(self: *const Self) bool {
-            const lock_thread = @atomicLoad(u64, &self._lock_thread, .Monotonic);
-            const this_thread = Thread.getCurrentId();
-            return lock_thread != this_thread;
-        }
     };
 }
 
@@ -733,12 +826,12 @@ inline fn maybeUnused(_: anytype) void {}
 
 test "JobQueue basics" {
     const Jobs = JobQueue(.{
-        // .max_threads = 4,
+        // .max_threads = 8,
     });
 
     std.debug.print("\n@sizeOf(Jobs):{}\n", .{@sizeOf(Jobs)});
 
-    const job_workload_size = cache_line_size * 1024 * 1024 * 4;
+    const job_workload_size = cache_line_size * 1024 * 1024 * 2;
     const JobWorkload = struct {
         const Unit = u64;
         const unit_size = @sizeOf(Unit);
@@ -775,7 +868,7 @@ test "JobQueue basics" {
         }
     };
 
-    const job_count = 32;
+    const job_count = 64;
 
     var allocator = std.testing.allocator;
     var job_workloads: []JobWorkload = try allocator.alignedAlloc(JobWorkload, @alignOf(JobWorkload), job_count);
@@ -790,22 +883,6 @@ test "JobQueue basics" {
         }
     };
 
-    const ZeroJob = struct {
-        stat: *JobStat,
-        workload: *JobWorkload,
-
-        fn main(self: *@This()) void {
-            self.stat.start();
-            defer self.stat.stop();
-
-            assertEqual("workload aligned", @ptrToInt(self.workload) % 64, 0);
-            for (self.workload.units) |*unit| {
-                unit.* = 0;
-            }
-        }
-    };
-    maybeUnused(ZeroJob);
-
     const FillJob = struct {
         stat: *JobStat,
         workload: *JobWorkload,
@@ -816,45 +893,43 @@ test "JobQueue basics" {
 
             assertEqual("workload aligned", @ptrToInt(self.workload) % 64, 0);
             for (self.workload.units) |*unit, index| {
-                unit.* = index;
+                unit.* = index % @bitSizeOf(JobWorkload.Unit);
             }
         }
     };
     maybeUnused(FillJob);
 
-    {
-        const loop_count = 4;
-        var job_stats: [job_count * loop_count]JobStat = undefined;
+    var job_stats: [job_count]JobStat = undefined;
 
-        var jobs = Jobs.init();
-        defer jobs.deinit();
+    var jobs = Jobs.init();
+    defer jobs.deinit();
 
-        jobs.start();
-        const started = now();
+    jobs.start();
+    const started = now();
 
-        for (job_stats) |*job_stat, i| {
-            _ = jobs.schedule(&.{}, FillJob{
-                .stat = job_stat,
-                .workload = &job_workloads[i % job_count],
-            });
-        }
-
-        _ = jobs.schedule(&.{}, StopJob{
-            .jobs = &jobs,
+    // schedule job_count jobs to fill some arrays
+    for (job_stats) |*job_stat, i| {
+        _ = jobs.scheduleAssumeReady(.none, FillJob{
+            .stat = job_stat,
+            .workload = &job_workloads[i % job_count],
         });
-
-        jobs.join();
-        const stopped = now();
-        const main_ms = stopped.since(started) / std.time.ns_per_ms;
-        var job_ms: u64 = 0;
-
-        for (job_stats) |job_stat, i| {
-            print("    job {}: {}\n", .{ i, job_stat });
-            job_ms += job_stat.ms();
-        }
-
-        const throughput = job_ms / main_ms;
-        print("completed {} jobs in {}ms ({}ms {}x)\n", .{job_count, main_ms, job_ms, throughput});
     }
 
+    // schedule a job to stop the job queue
+    _ = jobs.scheduleAssumeReady(.none, StopJob{
+        .jobs = &jobs,
+    });
+
+    jobs.join();
+    const stopped = now();
+    const main_ms = stopped.since(started) / std.time.ns_per_ms;
+    var job_ms: u64 = 0;
+
+    for (job_stats) |job_stat, i| {
+        print("    job {}: {}\n", .{ i, job_stat });
+        job_ms += job_stat.ms();
+    }
+
+    const throughput = @intToFloat(f64, job_ms) / @intToFloat(f64, main_ms);
+    print("completed {} jobs ({}ms) in {}ms ({d:.1}x)\n", .{job_count, job_ms, main_ms, throughput});
 }
