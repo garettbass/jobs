@@ -8,6 +8,14 @@ const print = std.debug.print;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+pub const cache_line_size = 64;
+
+pub const min_jobs = 16;
+
+pub const Error = error{ Uninitialized, Stopped };
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 pub const JobId = enum(u32) {
     none,
     _, // non-exhaustive enum
@@ -51,54 +59,28 @@ pub const JobId = enum(u32) {
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-pub const cache_line_size = 64;
-
-pub const min_jobs = 16;
-
-pub const Error = error{ Uninitialized, Stopped };
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-/// Returns a struct that executes jobs on a pool of threads.
-/// ```zig
-/// const Jobs = JobQueue(.{});
+/// Returns a struct that executes jobs on a pool of threads, which may be
+/// configured as follows:
+/// * `max_jobs` - the maximum number of jobs that can be waiting in the queue.
+/// * `max_job_size` - the maximum size of a job struct that can be stored in
+///    the queue.
+/// * `max_threads` - the maximum number of threads that can be spawned by the
+///   `JobQueue`. Even when `max_threads` is greater, the `JobQueue` will never
+///   spawn more than `std.Thread.getCpuCount() - 1` threads.
+/// * `idle_sleep_ns` - the maximum number of nanoseconds to sleep when a
+///   thread is waiting for a job to become available.  When `idle_sleep_ns`
+///   is `0`, idle threads will not sleep at all.
 ///
-/// var jobs = Jobs.init();
-/// defer jobs.deinit(); // waits for all threads and jobs to complete
-///
-/// // jobs can be scheduled before start() is called
-/// var a: JobId = try jobs.schedule(JobId.none, struct {
-///     fn main(_: *@This()) void {
-///         std.debug.print("hello ");
-///     }
-/// });
-///
-/// jobs.start(); // scheduled jobs will not execute until start() is called
-///
-/// // jobs can also be scheduled after start() is called
-/// var b: JobId = try jobs.schedule(a, struct {
-///    fn main(_: *@This()) void {
-///        std.debug.print("world!");
-///    }
-/// });
-///
-/// // a job can call stop()
-/// const StopJob = struct {
-///     jobs: *Jobs,
-///     fn main(self: *@This()) void {
-///         self.jobs.stop();
-///     }
-/// };
-/// var c: JobId = try jobs.schedule(b, StopJob{ .jobs = &jobs });
-///
-/// jobs.join(); // call join() to wait for all threads to finish after stop()
-/// ```
+/// Open issues:
+/// * `JobQueue` is not designed to support single threaded environments, and
+///   has not been tested for correctness in case background threads cannot be
+///   spawned.
 pub fn JobQueue(
     comptime config: struct {
         // zig fmt: off
         max_jobs      : u16 = 256,
-        max_threads   : u8  =   8,
         max_job_size  : u16 =  64,
+        max_threads   : u8  =   8,
         idle_sleep_ns : u32 =  10,
         // zig fmt: on
     },
@@ -140,22 +122,13 @@ pub fn JobQueue(
         cycle    : Atomic(u16)                 = .{ .value = 0 },
         // zig fmg: on
 
-        inline fn storeJob(
+        fn storeJob(
             self: *Self,
             comptime Job: type,
             job: *const Job,
             index: usize,
             prereq: JobId,
         ) JobId {
-            comptime compileAssert(
-                @sizeOf(Job) <= max_job_size,
-                "@sizeOf({s}) ({}) exceeds max_job_size ({})",
-                .{ @typeName(Job), @sizeOf(Job), max_job_size },
-            );
-
-            // const job_info = @typeInfo(Job);
-            // @compileLog(job_info);
-
             const old_cycle: u16 = self.cycle.load(.Acquire);
             assert(isFreeCycle(old_cycle));
 
@@ -265,6 +238,7 @@ pub fn JobQueue(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+        /// Initializes the `JobQueue`, required before calling `start()`.
         pub fn init() Self {
             comptime compileAssert(
                 @alignOf(Self) == cache_line_size,
@@ -285,15 +259,16 @@ pub fn JobQueue(
             return self;
         }
 
+        /// Calls `stop()` and `join()` as needed.
         pub fn deinit(self: *Self) void {
-            if (self._initialized.load(.Monotonic)) {
-                self.stop();
-                self.join();
-            }
+            if (self.isInitialized()) self.stop();
+            if (self.isStarted()) self.join();
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+        /// Spawn threads and begin executing jobs.
+        /// `JobQueue` must be initialized, and not yet started or stopped.
         pub fn start(self: *Self) void {
             self.lock("start");
             defer self.unlock("start");
@@ -319,7 +294,7 @@ pub fn JobQueue(
             const num_cpus = Thread.getCpuCount() catch 2;
             const num_threads_goal = std.math.min(num_cpus - 1, max_threads);
             while (n < num_threads_goal) {
-                if (Thread.spawn(.{}, main, .{ self, n })) |thread| {
+                if (Thread.spawn(.{}, threadMain, .{ self, n })) |thread| {
                     nameThread(thread, "JobQueue[{}]", .{n});
                     self._threads[n] = thread;
                     n += 1;
@@ -332,6 +307,8 @@ pub fn JobQueue(
             self._num_threads = n;
         }
 
+        /// Signals threads to stop running, and prevents scheduling more jobs.
+        /// Call `stop()` from any thread.
         pub fn stop(self: *Self) void {
             if (!self.isRunning()) return;
 
@@ -344,9 +321,18 @@ pub fn JobQueue(
             assert(was_stopping == false);
         }
 
+        /// Waits for all threads to finish, then executes any remaining jobs
+        /// before returning.  After `join()` returns, the `JobQueue` has been
+        /// reset to its default, uninitialized state.
+        /// Call `join()` from the same thread that called `start()`.
+        /// `JobQueue` must be initialized and started before calling `join()`.
+        /// You may call `join()` before calling `stop()`, but since `join()`
+        /// will not return until after `stop()` is called, you must then call
+        /// `stop()` from another thread, e.g. from a job.
         pub fn join(self: *Self) void {
-            assert(self.isStarted());
             assert(self.isMainThread());
+
+            if (!self.isStarted()) return;
 
             const n = self._num_threads;
             // print("joining {} threads...\n", .{n});
@@ -368,24 +354,38 @@ pub fn JobQueue(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+        /// Returns `true` if `init()` has been called, and `join()` has not
+        /// yet run to completion.
         pub fn isInitialized(self: *const Self) bool {
             return self._initialized.load(.Monotonic);
         }
 
+        /// Returns `true` if `start()` has been called, and `join()` has not
+        /// yet run to completion.
         pub fn isStarted(self: *const Self) bool {
             return self._started.load(.Monotonic);
         }
 
+        /// Returns `true` if `start()` has been called, and `stop()` has not
+        /// yet been called.
         pub fn isRunning(self: *const Self) bool {
             return self._running.load(.Monotonic);
         }
 
+        /// Returns `true` if `stop()` has been called, and `join()` has not
+        /// yet run to completion.
         pub fn isStopping(self: *const Self) bool {
             return self._stopping.load(.Monotonic);
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+        /// Returns `true` if the provided `JobId` identifies a job that has
+        /// been completed.
+        /// Returns `false` for a `JobId` that is scheduled and has not yet
+        /// completed execution.
+        /// Always returns `true` for `JobId.none`, which is always considered
+        /// trivially complete.
         pub fn isComplete(self: *const Self, id: JobId) bool {
             if (id == JobId.none) return true;
 
@@ -397,6 +397,13 @@ pub fn JobQueue(
             return slot_cycle != _id.cycle;
         }
 
+        /// Returns `true` if the provided `JobId` identifies a job that has
+        /// been scheduled and has not yet completed execution.  The job may or
+        /// may not already be executing on a background thread.
+        /// Returns `false` for a JobId that has not been scheduled, or has
+        /// already completed.
+        /// Always returns false for `JobId.none`, which is considered
+        /// trivially complete.
         pub fn isPending(self: *const Self, id: JobId) bool {
             if (id == JobId.none) return false;
 
@@ -408,58 +415,38 @@ pub fn JobQueue(
             return slot_cycle == _id.cycle;
         }
 
-        pub fn numPending(self: *const Self) usize {
+        /// Returns the number of jobs waiting in the queue.
+        /// Only includes jobs that have not yet begun execution.
+        pub fn numWaiting(self: *const Self) usize {
             return self._live_queue.len();
         }
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        const WaitJob = struct {
-            const jobs_size = @sizeOf(*Self);
-            const prereq_size = @sizeOf(JobId);
-            const max_prereqs = (max_job_size - jobs_size) / prereq_size;
-
-            jobs: *Self = .{},
-            prereqs: [max_prereqs]JobId = [_]JobId{JobId.none} ** max_prereqs,
-
-            fn main(job: *@This()) void {
-                for (job.prereqs) |prereq| {
-                    job.jobs.wait(prereq);
-                }
-            }
-        };
-
-        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-        pub fn combine(self: *Self, prereqs: []const JobId) Error!JobId {
-            var id = JobId.none;
-            var i: usize = 0;
-            const in: []const JobId = prereqs;
-            while (i < in.len) {
-                var wait_job = WaitJob{ .jobs = self };
-
-                // copy prereqs to wait_job
-                var o: usize = 0;
-                const out: []JobId = &wait_job.prereqs;
-                while (i < in.len and o < out.len) {
-                    out[o] = in[i];
-                    i += 1;
-                    o += 1;
-                }
-
-                id = try self.schedule(id, wait_job);
-            }
-            return id;
-        }
-
-        pub fn wait(self: *Self, prereq: JobId) void {
-            while (self.isPending(prereq)) {
-                // print("waiting for prereq {}...\n", .{prereq});
-                idle();
-            }
-        }
-
+        /// Inserts a job into the queue, and returns a `JobId` that can be
+        /// used to specify dependencies between jobs.
+        ///
+        /// `prereq` - specifies a job that must run to completion before the
+        /// job being scheduled can begin.  To schedule a job that must wait
+        /// for more than one job to complete, call `combine()` to consolidate
+        /// a set of `JobIds` into a single `JobId` that can be provided as the
+        /// `prereq` argument to `schedule()`.
+        ///
+        /// `job` - provides an instance of a struct that captures the context
+        /// and provides a function that will be executed on a separate thread.
+        /// The provided `job` must satisfy the following requirements:
+        /// * The total size of the job must not exceed `config.max_job_size`
+        /// * The job must be an instance of a struct
+        /// * The job must declare a function named `main` with one of the
+        ///   following supported signatures:
+        /// ```
+        ///   fn main(*@This())
+        ///   fn main(*const @This())
+        /// ```
         pub fn schedule(self: *Self, prereq: JobId, job: anytype) Error!JobId {
+            const Job = @TypeOf(job);
+            validateJob(Job);
+
             self.lock("schedule");
             defer self.unlock("schedule");
 
@@ -468,13 +455,50 @@ pub fn JobQueue(
 
             const index = self.dequeueFreeIndex();
             const slot: *Slot = &self._slots[index];
-            const Job = @TypeOf(job);
             const id = slot.storeJob(Job, &job, index, prereq);
             self.enqueueJobId(id);
             return id;
         }
 
-        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+        /// Combines zero or more `JobIds` into a single `JobId` that can be
+        /// provided to the `prereq` argument when calling `schedule()`.
+        /// This enables scheduling jobs that must wait on the completion of
+        /// an arbitrary number of other jobs.
+        /// Returns `JobId.none` when `prereqs` is empty.
+        /// Returns `prereqs[0]` when `prereqs` contains only one element.
+        pub fn combine(self: *Self, prereqs: []const JobId) Error!JobId {
+            if (prereqs.len == 0) return JobId.none;
+            if (prereqs.len == 1) return prereqs[0];
+
+            var id = JobId.none;
+            var i: usize = 0;
+            const in: []const JobId = prereqs;
+            while (i < in.len) {
+                var job = CombinePrereqsJob{ .jobs = self };
+
+                // copy prereqs to job
+                var o: usize = 0;
+                const out: []JobId = &job.prereqs;
+                while (i < in.len and o < out.len) {
+                    out[o] = in[i];
+                    i += 1;
+                    o += 1;
+                }
+
+                id = try self.schedule(id, job);
+            }
+            return id;
+        }
+
+        /// Waits until the specified `prereq` is completed.
+        pub fn wait(self: *Self, prereq: JobId) void {
+            while (self.isPending(prereq)) {
+                // print("waiting for prereq {}...\n", .{prereq});
+                threadIdle();
+            }
+        }
+
+        //----------------------------------------------------------------------
 
         fn dequeueFreeIndex(self: *Self) usize {
             assert(self.isLockedThread());
@@ -506,22 +530,22 @@ pub fn JobQueue(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        fn main(self: *Self, n: usize) void {
+        fn threadMain(self: *Self, n: usize) void {
+            print("thread[{}]: {}\n", .{ n, Thread.getCurrentId() });
             ignore(n);
-            // print("thread[{}]: {}\n", .{ n, Thread.getCurrentId() });
 
             assert(self.notMainThread());
             assert(self.isUnlockedThread());
 
             while (self.isRunning()) {
                 self.executeJobs(.unlocked, .dequeue_jobid_if_running);
-                idle();
+                threadIdle();
             }
 
             // print("thread[{}] DONE\n", .{n});
         }
 
-        fn idle() void {
+        fn threadIdle() void {
             if (idle_sleep_ns > 0) {
                 std.time.sleep(idle_sleep_ns);
             }
@@ -540,14 +564,31 @@ pub fn JobQueue(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        const ExecutionResult = enum {
+        const CombinePrereqsJob = struct {
+            const jobs_size = @sizeOf(*Self);
+            const prereq_size = @sizeOf(JobId);
+            const max_prereqs = (max_job_size - jobs_size) / prereq_size;
+
+            jobs: *Self = .{},
+            prereqs: [max_prereqs]JobId = [_]JobId{JobId.none} ** max_prereqs,
+
+            fn main(job: *@This()) void {
+                for (job.prereqs) |prereq| {
+                    job.jobs.wait(prereq);
+                }
+            }
+        };
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        const ExecuteJobResult = enum {
             acquire_free_index,
             enqueue_free_index,
             dequeue_jobid_after_join,
             dequeue_jobid_if_running,
         };
 
-        fn ExecutionReturnType(comptime result: ExecutionResult) type {
+        fn ExecuteJobReturnType(comptime result: ExecuteJobResult) type {
             return switch (result) {
                 // zig fmt: off
                 .acquire_free_index       => ?usize,
@@ -563,7 +604,7 @@ pub fn JobQueue(
         fn executeJobs(
             self: *Self,
             comptime scope: LockScope,
-            comptime result: ExecutionResult,
+            comptime result: ExecuteJobResult,
         ) void {
             var id = JobId.none;
             if (self.acquireJobId(scope, result)) |a| {
@@ -577,7 +618,7 @@ pub fn JobQueue(
         inline fn acquireJobId(
             self: *Self,
             comptime scope: LockScope,
-            comptime result: ExecutionResult,
+            comptime result: ExecuteJobResult,
         ) ?JobId {
             if (self._live_queue.isEmpty()) return null;
 
@@ -600,14 +641,12 @@ pub fn JobQueue(
             }
         }
 
-        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
         fn executeJob(
             self: *Self,
             id: JobId,
             comptime scope: LockScope,
-            comptime result: ExecutionResult,
-        ) ExecutionReturnType(result) {
+            comptime result: ExecuteJobResult,
+        ) ExecuteJobReturnType(result) {
             // print("executeJob({}, {}, {})\n", .{id, scope, result});
 
             const _id = id.fields();
@@ -626,9 +665,8 @@ pub fn JobQueue(
                 defer self.lockIfScopeLocked("executeJob(a)", scope);
 
                 // we cannot be locked when executing a job,
-                // because the job may call start() or schedule()
+                // because the job may call schedule() or stop()
                 assert(self.isUnlockedThread());
-
                 self.wait(slot.prereq);
                 slot.executeJob(id);
             }
@@ -773,6 +811,92 @@ pub fn JobQueue(
             assert(main_thread != 0);
             return main_thread != this_thread;
         }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        pub fn validateJob(comptime Job: type) void {
+            comptime {
+                const struct_info = switch (@typeInfo(Job)) {
+                    .Struct => |info| info,
+                    else => {
+                        compileError("{s} must be a struct", .{@typeName(Job)});
+                        unreachable;
+                    },
+                };
+
+                compileAssert(
+                    @sizeOf(Job) <= max_job_size,
+                    "@sizeOf({s}) ({}) exceeds max_job_size ({})",
+                    .{ @typeName(Job), @sizeOf(Job), max_job_size },
+                );
+
+                for (struct_info.decls) |decl| {
+                    if (std.mem.eql(u8, decl.name, "main")) {
+                        // compileAssert(
+                        //     decl.is_pub,
+                        //     "{s}.main must be public",
+                        //     .{ @typeName(Job) },
+                        // );
+                        break;
+                    }
+                } else {
+                    compileError(
+                        "{s}.main(*{s}) not found",
+                        .{ @typeName(Job), @typeName(Job) },
+                    );
+                }
+
+                const Main = @TypeOf(@field(Job, "main"));
+                const fn_info = switch (@typeInfo(Main)) {
+                    .Fn => |info| info,
+                    else => {
+                        compileError(
+                            "{s}.main must be a function",
+                            .{@typeName(Job)},
+                        );
+                        unreachable;
+                    },
+                };
+
+                compileAssert(
+                    fn_info.is_generic == false,
+                    "{s}.main() must not be generic",
+                    .{@typeName(Job)},
+                );
+
+                compileAssert(
+                    fn_info.is_var_args == false,
+                    "{s}.main() must not have variadic arguments",
+                    .{@typeName(Job)},
+                );
+
+                compileAssert(
+                    fn_info.return_type != null,
+                    "{s}.main() must return void",
+                    .{@typeName(Job)},
+                );
+
+                compileAssert(
+                    fn_info.return_type == void,
+                    "{s}.main() must return void, not {s}",
+                    .{ @typeName(Job), @typeName(fn_info.return_type.?) },
+                );
+
+                compileAssert(
+                    fn_info.args.len > 0,
+                    "{s}.main() must have at least one parameter",
+                    .{@typeName(Job)},
+                );
+
+                const arg_type_0 = fn_info.args[0].arg_type;
+
+                compileAssert(
+                    arg_type_0 == *Job or arg_type_0 == *const Job,
+                    "{s}.main() must accept *@This() or *const @This() as first parameter",
+                    .{@typeName(Job)},
+                );
+            }
+        }
     };
 }
 
@@ -818,19 +942,25 @@ test "JobQueue basics" {
         .max_threads = 8,
     });
 
-    defer print("--- END OF LINE ---\n", .{});
     print("\n@sizeOf(Jobs):{}\n", .{@sizeOf(Jobs)});
 
     const main_thread = std.Thread.getCurrentId();
     print("main_thread: {}\n", .{main_thread});
 
-    const job_workload_size = cache_line_size * 1024 * 1024 * 2;
+    const job_count = 64;
+    const job_workload_size = cache_line_size * 1024 * 1024;
     const JobWorkload = struct {
         const Unit = u64;
         const unit_size = @sizeOf(Unit);
         const unit_count = job_workload_size / unit_size;
         units: [unit_count]Unit align(cache_line_size) = [_]Unit{undefined} ** unit_count,
     };
+
+    var allocator = std.testing.allocator;
+    var job_workloads: []JobWorkload = try allocator.alignedAlloc(JobWorkload, @alignOf(JobWorkload), job_count);
+    defer print("allocator.free(job_workloads) DONE\n", .{});
+    defer allocator.free(job_workloads);
+    defer print("allocator.free(job_workloads)...\n", .{});
 
     const JobStat = struct {
         main: std.Thread.Id = 0,
@@ -865,16 +995,9 @@ test "JobQueue basics" {
         }
     };
 
-    const job_count = 64;
+    var job_stats: [job_count]JobStat = [_]JobStat{.{ .main = main_thread }} ** job_count;
 
-    var allocator = std.testing.allocator;
-    var job_workloads: []JobWorkload = try allocator.alignedAlloc(JobWorkload, @alignOf(JobWorkload), job_count);
-
-    defer print("allocator.free(job_workloads) DONE\n", .{});
-    defer allocator.free(job_workloads);
-    defer print("allocator.free(job_workloads)...\n", .{});
-
-    const InitJob = struct {
+    const FillJob = struct {
         stat: *JobStat,
         workload: *JobWorkload,
 
@@ -883,24 +1006,19 @@ test "JobQueue basics" {
             defer self.stat.stop();
 
             assert(@ptrToInt(self.workload) % 64 == 0);
-            const thread : u64 = self.stat.thread;
+            const thread: u64 = self.stat.thread;
             for (self.workload.units) |*unit, index| {
                 unit.* = thread +% index;
             }
         }
     };
 
-    var job_stats: [job_count]JobStat = [_]JobStat{.{ .main = main_thread }} ** job_count;
-
     var jobs = Jobs.init();
     defer jobs.deinit();
 
-    jobs.start();
-    const started = now();
-
     // schedule job_count jobs to fill some arrays
     for (job_stats) |*job_stat, i| {
-        _ = try jobs.schedule(.none, InitJob{
+        _ = try jobs.schedule(.none, FillJob{
             .stat = job_stat,
             .workload = &job_workloads[i % job_count],
         });
@@ -913,6 +1031,9 @@ test "JobQueue basics" {
             self.jobs.stop();
         }
     }{ .jobs = &jobs });
+
+    jobs.start();
+    const started = now();
 
     jobs.join();
     const stopped = now();
